@@ -1,4 +1,4 @@
-%% Copyright (c) 2011-2012 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2011-2012, 2014 Basho Technologies, Inc.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -24,7 +24,10 @@
 -export([init/1, handle_call/2, handle_event/2, handle_info/2, terminate/2,
         code_change/3]).
 
--record(state, {level, formatter,format_config,colors=[]}).
+-record(state, {level :: {'mask', integer()},
+                formatter :: atom(),
+                format_config :: any(),
+                colors=[] :: list()}).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -41,21 +44,33 @@ init([Level,false]) -> % for backwards compatibility
     init([Level,{lager_default_formatter,?TERSE_FORMAT ++ [eol()]}]);
 init([Level,{Formatter,FormatterConfig}]) when is_atom(Formatter) ->
     Colors = case application:get_env(lager, colored) of
-        {ok, true} -> 
+        {ok, true} ->
             {ok, LagerColors} = application:get_env(lager, colors),
             LagerColors;
         _ -> []
     end,
 
-    try lager_util:config_to_mask(Level) of
-        Levels ->
+    try {is_new_style_console_available(), lager_util:config_to_mask(Level)} of
+        {false, _} ->
+            Msg = "Lager's console backend is incompatible with the 'old' shell, not enabling it",
+            %% be as noisy as possible, log to every possible place
+            try
+                alarm_handler:set_alarm({?MODULE, "WARNING: " ++ Msg})
+            catch
+                _:_ ->
+                    error_logger:warning_msg(Msg ++ "~n")
+            end,
+            io:format("WARNING: " ++ Msg ++ "~n"),
+            ?INT_LOG(warning, Msg, []),
+            {error, {fatal, old_shell}};
+        {true, Levels} ->
             {ok, #state{level=Levels,
-                    formatter=Formatter, 
+                    formatter=Formatter,
                     format_config=FormatterConfig,
                     colors=Colors}}
     catch
         _:_ ->
-            {error, bad_log_level}
+            {error, {fatal, bad_log_level}}
     end;
 init(Level) ->
     init([Level,{lager_default_formatter,?TERSE_FORMAT ++ [eol()]}]).
@@ -104,9 +119,29 @@ eol() ->
     case application:get_env(lager, colored) of
         {ok, true}  ->
             "\e[0m\r\n";
-        _ -> 
+        _ ->
             "\r\n"
     end.
+
+-ifdef(TEST).
+is_new_style_console_available() ->
+    true.
+-else.
+is_new_style_console_available() ->
+    %% Criteria:
+    %% 1. If the user has specified '-noshell' on the command line,
+    %%    then we will pretend that the new-style console is available.
+    %%    If there is no shell at all, then we don't have to worry
+    %%    about log events being blocked by the old-style shell.
+    %% 2. Windows doesn't support the new shell, so all windows users
+    %%    have is the oldshell.
+    %% 3. If the user_drv process is registered, all is OK.
+    %%    'user_drv' is a registered proc name used by the "new"
+    %%    console driver.
+    init:get_argument(noshell) /= error orelse
+        element(1, os:type()) /= win32 orelse
+        is_pid(whereis(user_drv)).
+-endif.
 
 -ifdef(TEST).
 console_log_test_() ->
@@ -133,13 +168,14 @@ console_log_test_() ->
                 application:load(lager),
                 application:set_env(lager, handlers, []),
                 application:set_env(lager, error_logger_redirect, false),
-                application:start(lager),
+                lager:start(),
                 whereis(user)
         end,
         fun(User) ->
                 unregister(user),
                 register(user, User),
                 application:stop(lager),
+                application:stop(goldrush),
                 error_logger:tty(true)
         end,
         [
@@ -189,7 +225,7 @@ console_log_test_() ->
                         unregister(user),
                         register(user, Pid),
                         erlang:group_leader(Pid, whereis(lager_event)),
-                        gen_event:add_handler(lager_event, lager_console_backend, 
+                        gen_event:add_handler(lager_event, lager_console_backend,
                           [info, {lager_default_formatter, [date,"#",time,"#",severity,"#",node,"#",pid,"#",
                                                             module,"#",function,"#",file,"#",line,"#",message,"\r\n"]}]),
                         lager_config:set(loglevel, {?INFO, []}),
@@ -200,7 +236,7 @@ console_log_test_() ->
                         receive
                             {io_request, _, _, {put_chars, unicode, Msg}} ->
                                 TestMsg = "Test message" ++ eol(),
-                                ?assertMatch([_, _, "info", NodeStr, PidStr, ModuleStr, _, _, _, TestMsg], 
+                                ?assertMatch([_, _, "info", NodeStr, PidStr, ModuleStr, _, _, _, TestMsg],
                                              re:split(Msg, "#", [{return, list}, {parts, 10}]))
                         after
                             500 ->
@@ -349,10 +385,11 @@ set_loglevel_test_() ->
                 application:load(lager),
                 application:set_env(lager, handlers, [{lager_console_backend, info}]),
                 application:set_env(lager, error_logger_redirect, false),
-                application:start(lager)
+                lager:start()
         end,
         fun(_) ->
                 application:stop(lager),
+                application:stop(goldrush),
                 error_logger:tty(true)
         end,
         [
